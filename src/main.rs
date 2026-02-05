@@ -7,6 +7,7 @@ mod stt_parakeet;
 mod stt_whisper;
 mod transcriber;
 mod vad;
+mod wake_sound;
 
 use std::process::Command;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -22,13 +23,12 @@ use buffer::{AudioBuffer, RollingBuffer};
 use state::{AppState, SpeechDebouncer};
 use transcriber::Transcriber;
 use vad::Vad;
+use wake_sound::WakeSoundDetector;
 
 const VAD_MODEL_PATH: &str = "models/silero_vad.onnx";
 
 const VAD_THRESHOLD: f32 = 0.5;
 const VAD_DEBOUNCE_FRAMES: u32 = 4; // ~128ms of consecutive speech
-const WAKE_WORD_SILENCE_FRAMES: u32 = 10; // ~320ms silence = end of utterance
-const WAKE_WORD_TIMEOUT_MS: u64 = 3000; // max time to wait for wake word utterance
 const SILENCE_TIMEOUT_SECS: u64 = 30;
 
 const ROLLING_BUFFER_SECS: f32 = 3.0;
@@ -101,6 +101,12 @@ fn main() -> Result<()> {
     let engine = stt::create_engine(engine_name.as_deref())?;
     let transcriber = Transcriber::new(engine);
 
+    // Warm up STT engine with a dummy inference to pay JIT/CoreML compilation cost upfront
+    let _ = transcriber.transcribe(&vec![0.0f32; 8000]);
+    eprintln!("STT engine warmed up.");
+
+    let mut wake_detector = WakeSoundDetector::new()?;
+
     // Start audio capture
     let (_stream, mut consumer) = audio::build_input_stream()?;
 
@@ -133,7 +139,7 @@ fn main() -> Result<()> {
     let window_size = vad.window_size();
     let mut vad_window = vec![0.0f32; window_size];
 
-    eprintln!("\n\u{1f4a4} System ready — say \"clanker mic\" to start, \"done\" to stop.\n");
+    eprintln!("\n\u{1f4a4} System ready — snap/clap/whistle to start, \"done\" to stop.\n");
 
     // Main processing loop
     while running.load(Ordering::SeqCst) {
@@ -158,27 +164,11 @@ fn main() -> Result<()> {
 
         match app_state {
             AppState::Sleep => {
-                if debouncer.update(prob) {
-                    app_state = AppState::wake_word_check();
-                    debouncer.reset();
-                    eprintln!("\u{1f50d} Speech detected, waiting for utterance to finish...");
-                }
-            }
-
-            AppState::WakeWordCheck { started_at, ref mut silence_frames } => {
-                if prob < VAD_THRESHOLD {
-                    *silence_frames += 1;
-                } else {
-                    *silence_frames = 0;
-                }
-
-                let utterance_ended = *silence_frames >= WAKE_WORD_SILENCE_FRAMES;
-                let timed_out = started_at.elapsed() >= Duration::from_millis(WAKE_WORD_TIMEOUT_MS);
-
-                if utterance_ended || timed_out {
+                if wake_detector.check_energy_spike(&vad_window) {
                     let snapshot = rolling.snapshot();
-                    match transcriber.check_wake_word(&snapshot) {
-                        Ok(true) => {
+                    match wake_detector.classify(&snapshot) {
+                        Ok(Some((class_idx, label, prob))) => {
+                            eprintln!("[WAKE] Detected: {} (class {}, p={:.3})", label, class_idx, prob);
                             app_state = AppState::activate();
                             audio_buf.clear();
                             vad.reset();
@@ -196,15 +186,9 @@ fn main() -> Result<()> {
                             play_sound("Tink");
                             eprintln!("\n\u{1f3a4} [ACTIVATED] — Listening and transcribing...\n");
                         }
-                        Ok(false) => {
-                            app_state = AppState::Sleep;
-                            debouncer.reset();
-                            eprintln!("\u{1f4a4} Not a wake word, returning to sleep.\n");
-                        }
+                        Ok(None) => {}
                         Err(e) => {
-                            eprintln!("Wake word check error: {:#}", e);
-                            app_state = AppState::Sleep;
-                            debouncer.reset();
+                            eprintln!("CED classification error: {:#}", e);
                         }
                     }
                 }
@@ -392,7 +376,7 @@ fn deactivate(
     audio_buf.clear();
     vad.reset();
     debouncer.reset();
-    eprintln!("\u{1f4a4} Listening for wake word...\n");
+    eprintln!("\u{1f4a4} Listening for wake sound...\n");
 }
 
 /// Diff-based retype: backspace the changed suffix and type the new one.

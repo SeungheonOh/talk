@@ -1,15 +1,10 @@
 use std::time::Instant;
 
-/// Application state machine for wake-word activated transcription.
+/// Application state machine for sound-activated transcription.
 #[derive(Debug)]
 pub enum AppState {
-    /// Low-power mode: only VAD running.
+    /// Low-power mode: energy spike detection + CED classifier.
     Sleep,
-    /// VAD detected speech; accumulating audio until the utterance ends, then check for wake word.
-    WakeWordCheck {
-        started_at: Instant,
-        silence_frames: u32,
-    },
     /// Full transcription mode.
     Active {
         activated_at: Instant,
@@ -18,13 +13,6 @@ pub enum AppState {
 }
 
 impl AppState {
-    pub fn wake_word_check() -> Self {
-        AppState::WakeWordCheck {
-            started_at: Instant::now(),
-            silence_frames: 0,
-        }
-    }
-
     pub fn activate() -> Self {
         let now = Instant::now();
         AppState::Active {
