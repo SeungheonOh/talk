@@ -3,7 +3,7 @@ use anyhow::Result;
 use crate::stt::SttEngine;
 
 /// Wake word phrases to detect (lowercase).
-const WAKE_PHRASES: &[&str] = &["clanker mic", "voice"];
+const WAKE_PHRASES: &[&str] = &["clanker mic", "voice", "speech"];
 
 /// Commands that trigger deactivation (lowercase).
 const DEACTIVATION_COMMANDS: &[&str] = &["done", "stop"];

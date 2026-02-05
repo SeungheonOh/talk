@@ -12,7 +12,9 @@ pub struct WhisperEngine {
 
 impl WhisperEngine {
     pub fn new(model_path: &str) -> Result<Self> {
-        let ctx = WhisperContext::new_with_params(model_path, WhisperContextParameters::default())
+        let mut ctx_params = WhisperContextParameters::default();
+        ctx_params.flash_attn(true);
+        let ctx = WhisperContext::new_with_params(model_path, ctx_params)
             .with_context(|| format!("Failed to load Whisper model from '{}'", model_path))?;
         Ok(Self { ctx })
     }

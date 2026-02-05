@@ -1,5 +1,6 @@
 mod audio;
 mod buffer;
+mod llm;
 mod state;
 mod stt;
 mod stt_parakeet;
@@ -14,7 +15,7 @@ use std::thread;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
-use enigo::{Enigo, Keyboard, Settings};
+use enigo::{Direction, Enigo, Key, Keyboard, Settings};
 use ringbuf::traits::*;
 
 use buffer::{AudioBuffer, RollingBuffer};
@@ -35,6 +36,43 @@ const ROLLING_BUFFER_SECS: f32 = 3.0;
 // VAD-based chunking: transcribe after a pause or when max duration is hit
 const UTTERANCE_SILENCE_FRAMES: u32 = 10; // ~320ms silence = utterance boundary
 const MAX_UTTERANCE_SAMPLES: usize = 16000 * 15; // 15 sec failsafe for non-stop speech
+
+/// Return the last `n` chars of `s`, or all of `s` if shorter.
+fn tail_chars(s: &str, n: usize) -> &str {
+    let char_count = s.chars().count();
+    if char_count <= n {
+        return s;
+    }
+    let skip = char_count - n;
+    let byte_offset: usize = s.chars().take(skip).map(|c| c.len_utf8()).sum();
+    &s[byte_offset..]
+}
+
+fn build_display(finalized: &str, pending: &str) -> String {
+    if finalized.is_empty() {
+        pending.to_string()
+    } else if pending.is_empty() {
+        finalized.to_string()
+    } else {
+        format!("{} {}", finalized, pending)
+    }
+}
+
+/// Build the pending portion of the display, handling partial LLM coverage.
+fn build_pending_display(
+    pending_raw: &[String],
+    pending_corrected: &Option<String>,
+    corrected_count: usize,
+) -> String {
+    match pending_corrected {
+        Some(c) if corrected_count < pending_raw.len() => {
+            let uncovered = pending_raw[corrected_count..].join(" ");
+            format!("{} {}", c, uncovered)
+        }
+        Some(c) => c.clone(),
+        None => pending_raw.join(" "),
+    }
+}
 
 fn main() -> Result<()> {
     // Graceful shutdown on Ctrl+C
@@ -66,8 +104,12 @@ fn main() -> Result<()> {
     // Start audio capture
     let (_stream, mut consumer) = audio::build_input_stream()?;
 
-    // Keyboard simulator
-    let mut enigo = Enigo::new(&Settings::default()).context("Failed to init keyboard simulator")?;
+    // Keyboard simulator (mac_delay=0: fast_text handles its own delay for typing,
+    // and we don't want 20ms×2 per backspace during retype)
+    let mut enigo = Enigo::new(&Settings {
+        mac_delay: 0,
+        ..Settings::default()
+    }).context("Failed to init keyboard simulator")?;
 
     // State
     let mut app_state = AppState::Sleep;
@@ -77,6 +119,16 @@ fn main() -> Result<()> {
     let mut typed_any = false;
     let mut utterance_silence: u32 = 0; // consecutive silence frames in Active mode
     let mut chunk_has_speech = false; // whether current chunk contains any speech
+
+    // LLM post-processing (optional)
+    let llm = llm::LlmHandle::spawn("http://localhost:8080");
+    let mut finalized = String::new();
+    let mut pending_raw: Vec<String> = Vec::new();
+    let mut pending_corrected: Option<String> = None;
+    let mut pending_corrected_count: usize = 0;
+    let mut last_sent_count: usize = 0;
+    let mut displayed_text = String::new();
+    let mut llm_seq: u64 = 0;
 
     let window_size = vad.window_size();
     let mut vad_window = vec![0.0f32; window_size];
@@ -134,6 +186,13 @@ fn main() -> Result<()> {
                             typed_any = false;
                             utterance_silence = 0;
                             chunk_has_speech = false;
+                            finalized.clear();
+                            pending_raw.clear();
+                            pending_corrected = None;
+                            pending_corrected_count = 0;
+                            last_sent_count = 0;
+                            displayed_text.clear();
+                            llm_seq = 0;
                             play_sound("Tink");
                             eprintln!("\n\u{1f3a4} [ACTIVATED] — Listening and transcribing...\n");
                         }
@@ -152,6 +211,21 @@ fn main() -> Result<()> {
             }
 
             AppState::Active { .. } => {
+                // Check for LLM corrections
+                if let Some(ref llm_handle) = llm {
+                    while let Some((seq, corrected)) = llm_handle.try_recv() {
+                        if seq == llm_seq - 1 {
+                            pending_corrected = Some(corrected);
+                            pending_corrected_count = last_sent_count;
+                            let pending = build_pending_display(
+                                &pending_raw, &pending_corrected, pending_corrected_count,
+                            );
+                            let display = build_display(&finalized, &pending);
+                            retype(&mut enigo, &mut displayed_text, &display);
+                        }
+                    }
+                }
+
                 // Track speech activity for silence timeout
                 if prob >= VAD_THRESHOLD {
                     app_state.touch_speech();
@@ -175,6 +249,12 @@ fn main() -> Result<()> {
                     }
                     play_sound("Funk");
                     deactivate(&mut app_state, &mut audio_buf, &mut vad, &mut debouncer);
+                    finalized.clear();
+                    pending_raw.clear();
+                    pending_corrected = None;
+                    pending_corrected_count = 0;
+                    last_sent_count = 0;
+                    displayed_text.clear();
                     utterance_silence = 0;
                     chunk_has_speech = false;
                     continue;
@@ -203,16 +283,49 @@ fn main() -> Result<()> {
                                             &mut vad,
                                             &mut debouncer,
                                         );
+                                        finalized.clear();
+                                        pending_raw.clear();
+                                        pending_corrected = None;
+                                        pending_corrected_count = 0;
+                                        last_sent_count = 0;
+                                        displayed_text.clear();
                                         utterance_silence = 0;
                                         chunk_has_speech = false;
                                         continue;
                                     }
 
-                                    if typed_any {
-                                        let _ = enigo.text(" ");
+                                    // Add new raw utterance (never fold corrections back)
+                                    pending_raw.push(trimmed.to_string());
+
+                                    // Finalize if window is too large and we have a correction
+                                    let raw_joined = pending_raw.join(" ");
+                                    if raw_joined.len() > 300 && pending_corrected.is_some() {
+                                        let corrected = pending_corrected.take().unwrap();
+                                        if finalized.is_empty() {
+                                            finalized = corrected;
+                                        } else {
+                                            finalized = format!("{} {}", finalized, corrected);
+                                        }
+                                        pending_raw = pending_raw.split_off(pending_corrected_count);
+                                        pending_corrected_count = 0;
                                     }
-                                    let _ = enigo.text(trimmed);
+
+                                    // Optimistic display
+                                    let pending = build_pending_display(
+                                        &pending_raw, &pending_corrected, pending_corrected_count,
+                                    );
+                                    let display = build_display(&finalized, &pending);
+                                    retype(&mut enigo, &mut displayed_text, &display);
                                     typed_any = true;
+
+                                    // Send all raw to LLM
+                                    if let Some(ref llm_handle) = llm {
+                                        let raw_text = pending_raw.join(" ");
+                                        let hint = tail_chars(&finalized, 80);
+                                        llm_handle.request(llm_seq, hint, &raw_text);
+                                        last_sent_count = pending_raw.len();
+                                        llm_seq += 1;
+                                    }
                                 }
                             }
                             Err(e) => {
@@ -280,4 +393,32 @@ fn deactivate(
     vad.reset();
     debouncer.reset();
     eprintln!("\u{1f4a4} Listening for wake word...\n");
+}
+
+/// Diff-based retype: backspace the changed suffix and type the new one.
+fn retype(enigo: &mut Enigo, displayed: &mut String, new_text: &str) {
+    let common_chars = displayed
+        .chars()
+        .zip(new_text.chars())
+        .take_while(|(a, b)| a == b)
+        .count();
+    let common_byte_len: usize = displayed
+        .chars()
+        .take(common_chars)
+        .map(|c| c.len_utf8())
+        .sum();
+
+    // Backspace the suffix of displayed that changed
+    let remove_chars = displayed[common_byte_len..].chars().count();
+    for _ in 0..remove_chars {
+        let _ = enigo.key(Key::Backspace, Direction::Click);
+    }
+
+    // Type the new suffix
+    let new_suffix = &new_text[common_byte_len..];
+    if !new_suffix.is_empty() {
+        let _ = enigo.text(new_suffix);
+    }
+
+    *displayed = new_text.to_string();
 }
