@@ -7,7 +7,9 @@ mod stt_parakeet;
 mod stt_whisper;
 mod transcriber;
 mod vad;
+mod wake;
 mod wake_sound;
+mod wake_word;
 
 use std::process::Command;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -20,15 +22,16 @@ use enigo::{Direction, Enigo, Key, Keyboard, Settings};
 use ringbuf::traits::*;
 
 use buffer::{AudioBuffer, RollingBuffer};
-use state::{AppState, SpeechDebouncer};
+use state::AppState;
 use transcriber::Transcriber;
 use vad::Vad;
+use wake::{WakeDetector, WakeResult};
 use wake_sound::WakeSoundDetector;
+use wake_word::WakeWordDetector;
 
 const VAD_MODEL_PATH: &str = "models/silero_vad.onnx";
 
 const VAD_THRESHOLD: f32 = 0.5;
-const VAD_DEBOUNCE_FRAMES: u32 = 4; // ~128ms of consecutive speech
 const SILENCE_TIMEOUT_SECS: u64 = 30;
 
 const ROLLING_BUFFER_SECS: f32 = 3.0;
@@ -74,7 +77,67 @@ fn build_pending_display(
     }
 }
 
+fn print_help() {
+    let bin = std::env::args().next().unwrap_or_else(|| "voicer".into());
+    eprintln!("Usage: {} [OPTIONS]", bin);
+    eprintln!();
+    eprintln!("Options:");
+    eprintln!("  --engine <name>   STT engine: whisper, parakeet (default: auto-detect)");
+    eprintln!("  --wake <mode>     Wake mode: sound, word (default: sound)");
+    eprintln!("  --help, -h        Show this help message");
+    eprintln!();
+    eprintln!("Wake modes:");
+    eprintln!("  sound   Activate by snap, clap, whistle, click, or pop (CED-Tiny)");
+    eprintln!("  word    Activate by saying a wake phrase (uses STT engine)");
+    eprintln!();
+    eprintln!("Say \"done\" or \"stop\" while active to deactivate.");
+}
+
+fn parse_args() -> (Option<String>, String) {
+    let args: Vec<String> = std::env::args().collect();
+    let mut engine: Option<String> = None;
+    let mut wake = "sound".to_string();
+
+    let mut i = 1;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--help" | "-h" => {
+                print_help();
+                std::process::exit(0);
+            }
+            "--engine" => {
+                engine = args.get(i + 1).cloned();
+                i += 1;
+            }
+            "--wake" => {
+                if let Some(val) = args.get(i + 1) {
+                    wake = val.clone();
+                }
+                i += 1;
+            }
+            _ if args[i].starts_with("--engine=") => {
+                engine = args[i].strip_prefix("--engine=").map(|s| s.to_string());
+            }
+            _ if args[i].starts_with("--wake=") => {
+                if let Some(val) = args[i].strip_prefix("--wake=") {
+                    wake = val.to_string();
+                }
+            }
+            other => {
+                eprintln!("Unknown option: {}", other);
+                print_help();
+                std::process::exit(1);
+            }
+        }
+        i += 1;
+    }
+
+    (engine, wake)
+}
+
 fn main() -> Result<()> {
+    let (engine_name, wake_mode) = parse_args();
+
     // Graceful shutdown on Ctrl+C
     let running = Arc::new(AtomicBool::new(true));
     let r = running.clone();
@@ -88,24 +151,25 @@ fn main() -> Result<()> {
     eprintln!("Loading VAD model from '{}'...", VAD_MODEL_PATH);
     let mut vad = Vad::new(VAD_MODEL_PATH)?;
     eprintln!("VAD model loaded.");
-
-    let engine_name = std::env::args().nth(1).and_then(|arg| {
-        if arg == "--engine" {
-            std::env::args().nth(2)
-        } else if let Some(val) = arg.strip_prefix("--engine=") {
-            Some(val.to_string())
-        } else {
-            None
-        }
-    });
     let engine = stt::create_engine(engine_name.as_deref())?;
-    let transcriber = Transcriber::new(engine);
 
     // Warm up STT engine with a dummy inference to pay JIT/CoreML compilation cost upfront
-    let _ = transcriber.transcribe(&vec![0.0f32; 8000]);
+    let _ = engine.transcribe(&vec![0.0f32; 8000]);
     eprintln!("STT engine warmed up.");
 
-    let mut wake_detector = WakeSoundDetector::new()?;
+    let transcriber = Transcriber::new(engine.clone());
+
+    let mut wake_detector: Box<dyn WakeDetector> = match wake_mode.as_str() {
+        "word" => {
+            eprintln!("Wake mode: speech (say wake phrase)");
+            Box::new(WakeWordDetector::new(engine.clone()))
+        }
+        "sound" => {
+            eprintln!("Wake mode: sound (snap/clap/whistle)");
+            Box::new(WakeSoundDetector::new()?)
+        }
+        other => anyhow::bail!("Unknown wake mode '{}'. Use 'sound' or 'word'.", other),
+    };
 
     // Start audio capture
     let (_stream, mut consumer) = audio::build_input_stream()?;
@@ -119,7 +183,6 @@ fn main() -> Result<()> {
 
     // State
     let mut app_state = AppState::Sleep;
-    let mut debouncer = SpeechDebouncer::new(VAD_THRESHOLD, VAD_DEBOUNCE_FRAMES);
     let mut rolling = RollingBuffer::new(ROLLING_BUFFER_SECS);
     let mut audio_buf = AudioBuffer::new();
     let mut typed_any = false;
@@ -139,7 +202,15 @@ fn main() -> Result<()> {
     let window_size = vad.window_size();
     let mut vad_window = vec![0.0f32; window_size];
 
-    eprintln!("\n\u{1f4a4} System ready — snap/clap/whistle to start, \"done\" to stop.\n");
+    let wake_hint = if wake_mode == "word" {
+        "say wake phrase"
+    } else {
+        "snap/clap/whistle"
+    };
+    eprintln!(
+        "\n\u{1f4a4} System ready — {} to start, \"done\" to stop.\n",
+        wake_hint
+    );
 
     // Main processing loop
     while running.load(Ordering::SeqCst) {
@@ -164,33 +235,26 @@ fn main() -> Result<()> {
 
         match app_state {
             AppState::Sleep => {
-                if wake_detector.check_energy_spike(&vad_window) {
-                    let snapshot = rolling.snapshot();
-                    match wake_detector.classify(&snapshot) {
-                        Ok(Some((class_idx, label, prob))) => {
-                            eprintln!("[WAKE] Detected: {} (class {}, p={:.3})", label, class_idx, prob);
-                            app_state = AppState::activate();
-                            audio_buf.clear();
-                            vad.reset();
-                            debouncer.reset();
-                            typed_any = false;
-                            utterance_silence = 0;
-                            chunk_has_speech = false;
-                            finalized.clear();
-                            pending_raw.clear();
-                            pending_corrected = None;
-                            pending_corrected_count = 0;
-                            last_sent_count = 0;
-                            displayed_text.clear();
-                            llm_seq = 0;
-                            play_sound("Tink");
-                            eprintln!("\n\u{1f3a4} [ACTIVATED] — Listening and transcribing...\n");
-                        }
-                        Ok(None) => {}
-                        Err(e) => {
-                            eprintln!("CED classification error: {:#}", e);
-                        }
+                match wake_detector.feed(&vad_window, prob, &rolling)? {
+                    WakeResult::Activated(desc) => {
+                        eprintln!("[WAKE] {}", desc);
+                        app_state = AppState::activate();
+                        audio_buf.clear();
+                        vad.reset();
+                        typed_any = false;
+                        utterance_silence = 0;
+                        chunk_has_speech = false;
+                        finalized.clear();
+                        pending_raw.clear();
+                        pending_corrected = None;
+                        pending_corrected_count = 0;
+                        last_sent_count = 0;
+                        displayed_text.clear();
+                        llm_seq = 0;
+                        play_sound("Tink");
+                        eprintln!("\n\u{1f3a4} [ACTIVATED] — Listening and transcribing...\n");
                     }
+                    WakeResult::Nothing => {}
                 }
             }
 
@@ -232,7 +296,7 @@ fn main() -> Result<()> {
                         transcribe_and_type(&transcriber, &mut audio_buf, &mut enigo, &mut typed_any);
                     }
                     play_sound("Funk");
-                    deactivate(&mut app_state, &mut audio_buf, &mut vad, &mut debouncer);
+                    deactivate(&mut app_state, &mut audio_buf, &mut vad, &mut *wake_detector);
                     finalized.clear();
                     pending_raw.clear();
                     pending_corrected = None;
@@ -265,7 +329,7 @@ fn main() -> Result<()> {
                                             &mut app_state,
                                             &mut audio_buf,
                                             &mut vad,
-                                            &mut debouncer,
+                                            &mut *wake_detector,
                                         );
                                         finalized.clear();
                                         pending_raw.clear();
@@ -370,13 +434,13 @@ fn deactivate(
     app_state: &mut AppState,
     audio_buf: &mut AudioBuffer,
     vad: &mut Vad,
-    debouncer: &mut SpeechDebouncer,
+    wake_detector: &mut dyn WakeDetector,
 ) {
     *app_state = AppState::Sleep;
     audio_buf.clear();
     vad.reset();
-    debouncer.reset();
-    eprintln!("\u{1f4a4} Listening for wake sound...\n");
+    wake_detector.reset();
+    eprintln!("\u{1f4a4} Listening for wake event...\n");
 }
 
 /// Diff-based retype: backspace the changed suffix and type the new one.

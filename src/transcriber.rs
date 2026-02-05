@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use anyhow::Result;
 
 use crate::stt::SttEngine;
@@ -7,11 +9,11 @@ const DEACTIVATION_COMMANDS: &[&str] = &["done", "stop"];
 
 /// Speech transcription manager that wraps any STT backend.
 pub struct Transcriber {
-    engine: Box<dyn SttEngine>,
+    engine: Arc<dyn SttEngine>,
 }
 
 impl Transcriber {
-    pub fn new(engine: Box<dyn SttEngine>) -> Self {
+    pub fn new(engine: Arc<dyn SttEngine>) -> Self {
         Self { engine }
     }
 

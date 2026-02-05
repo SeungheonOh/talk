@@ -1,10 +1,12 @@
+use std::sync::Arc;
+
 use anyhow::{Context, Result};
 
 use crate::stt_parakeet::ParakeetEngine;
 use crate::stt_whisper::WhisperEngine;
 
 /// Common interface for speech-to-text backends.
-pub trait SttEngine: Send {
+pub trait SttEngine: Send + Sync {
     /// Transcribe a complete audio segment (16kHz mono f32).
     fn transcribe(&self, audio: &[f32]) -> Result<String>;
 }
@@ -17,7 +19,7 @@ const WHISPER_MODEL_PATHS: &[&str] = &[
 
 /// Create an STT engine by name, or auto-detect if None.
 /// Default preference: whisper, then parakeet.
-pub fn create_engine(choice: Option<&str>) -> Result<Box<dyn SttEngine>> {
+pub fn create_engine(choice: Option<&str>) -> Result<Arc<dyn SttEngine>> {
     match choice {
         Some("whisper") => load_whisper(),
         Some("parakeet") => load_parakeet(),
@@ -26,7 +28,7 @@ pub fn create_engine(choice: Option<&str>) -> Result<Box<dyn SttEngine>> {
     }
 }
 
-fn load_whisper() -> Result<Box<dyn SttEngine>> {
+fn load_whisper() -> Result<Arc<dyn SttEngine>> {
     let model = WHISPER_MODEL_PATHS
         .iter()
         .find(|p| std::path::Path::new(p).exists())
@@ -35,10 +37,10 @@ fn load_whisper() -> Result<Box<dyn SttEngine>> {
     let engine = WhisperEngine::new(model)
         .with_context(|| format!("Failed to load Whisper model from '{}'", model))?;
     eprintln!("Whisper model loaded.");
-    Ok(Box::new(engine))
+    Ok(Arc::new(engine))
 }
 
-fn load_parakeet() -> Result<Box<dyn SttEngine>> {
+fn load_parakeet() -> Result<Arc<dyn SttEngine>> {
     let dir = std::path::Path::new(PARAKEET_DIR);
     anyhow::ensure!(
         dir.join("encoder-model.onnx").exists()
@@ -50,5 +52,5 @@ fn load_parakeet() -> Result<Box<dyn SttEngine>> {
     let engine = ParakeetEngine::new(PARAKEET_DIR)
         .context("Failed to load Parakeet TDT engine")?;
     eprintln!("Parakeet TDT loaded.");
-    Ok(Box::new(engine))
+    Ok(Arc::new(engine))
 }

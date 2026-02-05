@@ -1,9 +1,9 @@
 use std::time::Instant;
 
-/// Application state machine for sound-activated transcription.
+/// Application state machine.
 #[derive(Debug)]
 pub enum AppState {
-    /// Low-power mode: energy spike detection + CED classifier.
+    /// Low-power mode: wake detector running.
     Sleep,
     /// Full transcription mode.
     Active {
@@ -35,38 +35,5 @@ impl AppState {
         } else {
             false
         }
-    }
-}
-
-/// VAD speech debouncer. Requires N consecutive frames above threshold
-/// before confirming speech onset.
-pub struct SpeechDebouncer {
-    threshold: f32,
-    required_frames: u32,
-    consecutive_count: u32,
-}
-
-impl SpeechDebouncer {
-    pub fn new(threshold: f32, required_frames: u32) -> Self {
-        Self {
-            threshold,
-            required_frames,
-            consecutive_count: 0,
-        }
-    }
-
-    /// Feed a VAD probability. Returns true when speech is confirmed
-    /// (N consecutive frames above threshold).
-    pub fn update(&mut self, prob: f32) -> bool {
-        if prob >= self.threshold {
-            self.consecutive_count += 1;
-        } else {
-            self.consecutive_count = 0;
-        }
-        self.consecutive_count >= self.required_frames
-    }
-
-    pub fn reset(&mut self) {
-        self.consecutive_count = 0;
     }
 }
