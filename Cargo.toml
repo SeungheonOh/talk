@@ -1,0 +1,14 @@
+[package]
+name = "voicer"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+whisper-rs = "0.15"
+cpal = "0.17"
+ringbuf = "0.4"
+ort = { version = "2.0.0-rc.11", features = ["ndarray"] }
+ndarray = "0.17"
+anyhow = "1"
+ctrlc = "3"
+enigo = "0.2"
