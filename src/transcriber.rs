@@ -1,81 +1,35 @@
-use anyhow::{Context, Result};
-use whisper_rs::{FullParams, SamplingStrategy, WhisperContext, WhisperContextParameters};
+use anyhow::Result;
+
+use crate::stt::SttEngine;
 
 /// Wake word phrases to detect (lowercase).
-const WAKE_PHRASES: &[&str] = &["voice"];
+const WAKE_PHRASES: &[&str] = &["clanker mic", "voice"];
 
 /// Commands that trigger deactivation (lowercase).
-const DEACTIVATION_COMMANDS: &[&str] = &["done"];
+const DEACTIVATION_COMMANDS: &[&str] = &["done", "stop"];
 
-/// Whisper-based speech transcription engine.
+/// Speech transcription manager that wraps any STT backend.
+/// Handles wake word detection and deactivation commands.
 pub struct Transcriber {
-    ctx: WhisperContext,
-    n_threads: i32,
+    engine: Box<dyn SttEngine>,
 }
 
 impl Transcriber {
-    /// Load a Whisper model. This is expensive (~2-5s for large models). Do once at startup.
-    pub fn new(model_path: &str, n_threads: i32) -> Result<Self> {
-        let ctx = WhisperContext::new_with_params(model_path, WhisperContextParameters::default())
-            .with_context(|| format!("Failed to load Whisper model from '{}'", model_path))?;
-
-        Ok(Self { ctx, n_threads })
+    pub fn new(engine: Box<dyn SttEngine>) -> Self {
+        Self { engine }
     }
 
-    /// Create params configured for fast English transcription.
-    fn make_params(&self) -> FullParams<'_, '_> {
-        let mut params = FullParams::new(SamplingStrategy::Greedy { best_of: 1 });
-        params.set_n_threads(self.n_threads);
-        params.set_language(Some("en"));
-        params.set_print_progress(false);
-        params.set_print_realtime(false);
-        params.set_print_timestamps(false);
-        params.set_print_special(false);
-        params.set_suppress_blank(true);
-        params.set_suppress_nst(true);
-        params
-    }
-
-    /// Run transcription on audio and return all segment texts joined.
-    fn run_transcription(&self, audio: &[f32]) -> Result<String> {
-        let mut state = self
-            .ctx
-            .create_state()
-            .context("Failed to create Whisper state")?;
-
-        let params = self.make_params();
-        state
-            .full(params, audio)
-            .context("Whisper transcription failed")?;
-
-        let n_segments = state.full_n_segments();
-
-        let mut text = String::new();
-        for i in 0..n_segments {
-            if let Some(segment) = state.get_segment(i) {
-                if let Ok(segment_text) = segment.to_str() {
-                    text.push_str(segment_text);
-                }
-            }
-        }
-
-        Ok(text)
-    }
-
-    /// Check if the 3-second audio buffer contains a wake word.
-    /// Returns true if a wake phrase is detected.
+    /// Check if the audio buffer contains a wake word.
     pub fn check_wake_word(&self, audio: &[f32]) -> Result<bool> {
-        let text = self.run_transcription(audio)?;
+        let text = self.engine.transcribe(audio)?;
         let lower = text.to_lowercase();
-
-        let found = WAKE_PHRASES.iter().any(|phrase| lower.contains(phrase));
-
-        Ok(found)
+        eprintln!("  [wake check] heard: {:?}", lower.trim());
+        Ok(WAKE_PHRASES.iter().any(|phrase| lower.contains(phrase)))
     }
 
     /// Transcribe an audio chunk and return the text.
     pub fn transcribe(&self, audio: &[f32]) -> Result<String> {
-        self.run_transcription(audio)
+        self.engine.transcribe(audio)
     }
 
     /// Check if transcribed text contains a deactivation command.
@@ -85,5 +39,4 @@ impl Transcriber {
             .iter()
             .any(|cmd| lower.contains(cmd))
     }
-
 }

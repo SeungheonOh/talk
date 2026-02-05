@@ -1,6 +1,9 @@
 mod audio;
 mod buffer;
 mod state;
+mod stt;
+mod stt_parakeet;
+mod stt_whisper;
 mod transcriber;
 mod vad;
 
@@ -20,22 +23,17 @@ use transcriber::Transcriber;
 use vad::Vad;
 
 const VAD_MODEL_PATH: &str = "models/silero_vad.onnx";
-const WHISPER_MODEL_PATHS: &[&str] = &[
-    "models/ggml-base.en.bin",
-    "models/ggml-large-v3-turbo.bin",
-];
 
 const VAD_THRESHOLD: f32 = 0.5;
 const VAD_DEBOUNCE_FRAMES: u32 = 4; // ~128ms of consecutive speech
 const WAKE_WORD_SILENCE_FRAMES: u32 = 10; // ~320ms silence = end of utterance
 const WAKE_WORD_TIMEOUT_MS: u64 = 3000; // max time to wait for wake word utterance
 const SILENCE_TIMEOUT_SECS: u64 = 30;
-const WHISPER_THREADS: i32 = 4;
 
 const ROLLING_BUFFER_SECS: f32 = 3.0;
 
 // VAD-based chunking: transcribe after a pause or when max duration is hit
-const UTTERANCE_SILENCE_FRAMES: u32 = 16; // ~512ms silence = utterance boundary
+const UTTERANCE_SILENCE_FRAMES: u32 = 10; // ~320ms silence = utterance boundary
 const MAX_UTTERANCE_SAMPLES: usize = 16000 * 15; // 15 sec failsafe for non-stop speech
 
 fn main() -> Result<()> {
@@ -53,13 +51,17 @@ fn main() -> Result<()> {
     let mut vad = Vad::new(VAD_MODEL_PATH)?;
     eprintln!("VAD model loaded.");
 
-    let whisper_model = WHISPER_MODEL_PATHS
-        .iter()
-        .find(|p| std::path::Path::new(p).exists())
-        .context("No Whisper model found. Download one to models/ (e.g. ggml-base.en.bin)")?;
-    eprintln!("Loading Whisper model from '{}' ...", whisper_model);
-    let transcriber = Transcriber::new(whisper_model, WHISPER_THREADS)?;
-    eprintln!("Whisper model loaded.");
+    let engine_name = std::env::args().nth(1).and_then(|arg| {
+        if arg == "--engine" {
+            std::env::args().nth(2)
+        } else if let Some(val) = arg.strip_prefix("--engine=") {
+            Some(val.to_string())
+        } else {
+            None
+        }
+    });
+    let engine = stt::create_engine(engine_name.as_deref())?;
+    let transcriber = Transcriber::new(engine);
 
     // Start audio capture
     let (_stream, mut consumer) = audio::build_input_stream()?;
@@ -74,11 +76,12 @@ fn main() -> Result<()> {
     let mut audio_buf = AudioBuffer::new();
     let mut typed_any = false;
     let mut utterance_silence: u32 = 0; // consecutive silence frames in Active mode
+    let mut chunk_has_speech = false; // whether current chunk contains any speech
 
     let window_size = vad.window_size();
     let mut vad_window = vec![0.0f32; window_size];
 
-    eprintln!("\n\u{1f4a4} System ready — say \"voice\" to start, \"done\" to stop.\n");
+    eprintln!("\n\u{1f4a4} System ready — say \"clanker mic\" to start, \"done\" to stop.\n");
 
     // Main processing loop
     while running.load(Ordering::SeqCst) {
@@ -130,6 +133,7 @@ fn main() -> Result<()> {
                             debouncer.reset();
                             typed_any = false;
                             utterance_silence = 0;
+                            chunk_has_speech = false;
                             play_sound("Tink");
                             eprintln!("\n\u{1f3a4} [ACTIVATED] — Listening and transcribing...\n");
                         }
@@ -152,6 +156,7 @@ fn main() -> Result<()> {
                 if prob >= VAD_THRESHOLD {
                     app_state.touch_speech();
                     utterance_silence = 0;
+                    chunk_has_speech = true;
                 } else {
                     utterance_silence += 1;
                 }
@@ -165,10 +170,13 @@ fn main() -> Result<()> {
                         "\n\u{23f8}\u{fe0f} [DEACTIVATED] — Silence timeout ({}s)\n",
                         SILENCE_TIMEOUT_SECS
                     );
-                    transcribe_and_type(&transcriber, &mut audio_buf, &mut enigo, &mut typed_any);
+                    if chunk_has_speech {
+                        transcribe_and_type(&transcriber, &mut audio_buf, &mut enigo, &mut typed_any);
+                    }
                     play_sound("Funk");
                     deactivate(&mut app_state, &mut audio_buf, &mut vad, &mut debouncer);
                     utterance_silence = 0;
+                    chunk_has_speech = false;
                     continue;
                 }
 
@@ -178,38 +186,44 @@ fn main() -> Result<()> {
                 let max_duration = audio_buf.len() >= MAX_UTTERANCE_SAMPLES;
 
                 if pause_detected || max_duration {
-                    let chunk = audio_buf.take();
-                    match transcriber.transcribe(&chunk) {
-                        Ok(text) => {
-                            let trimmed = text.trim();
-                            if !trimmed.is_empty() {
-                                if Transcriber::is_deactivation_command(trimmed) {
-                                    eprintln!(
-                                        "\n\u{23f8}\u{fe0f} [DEACTIVATED] — Command recognized\n"
-                                    );
-                                    play_sound("Funk");
-                                    deactivate(
-                                        &mut app_state,
-                                        &mut audio_buf,
-                                        &mut vad,
-                                        &mut debouncer,
-                                    );
-                                    utterance_silence = 0;
-                                    continue;
-                                }
+                    if chunk_has_speech {
+                        let chunk = audio_buf.take();
+                        match transcriber.transcribe(&chunk) {
+                            Ok(text) => {
+                                let trimmed = text.trim();
+                                if !trimmed.is_empty() {
+                                    if Transcriber::is_deactivation_command(trimmed) {
+                                        eprintln!(
+                                            "\n\u{23f8}\u{fe0f} [DEACTIVATED] — Command recognized\n"
+                                        );
+                                        play_sound("Funk");
+                                        deactivate(
+                                            &mut app_state,
+                                            &mut audio_buf,
+                                            &mut vad,
+                                            &mut debouncer,
+                                        );
+                                        utterance_silence = 0;
+                                        chunk_has_speech = false;
+                                        continue;
+                                    }
 
-                                if typed_any {
-                                    let _ = enigo.text(" ");
+                                    if typed_any {
+                                        let _ = enigo.text(" ");
+                                    }
+                                    let _ = enigo.text(trimmed);
+                                    typed_any = true;
                                 }
-                                let _ = enigo.text(trimmed);
-                                typed_any = true;
+                            }
+                            Err(e) => {
+                                eprintln!("Transcription error: {:#}", e);
                             }
                         }
-                        Err(e) => {
-                            eprintln!("Transcription error: {:#}", e);
-                        }
+                    } else {
+                        audio_buf.clear();
                     }
                     utterance_silence = 0;
+                    chunk_has_speech = false;
                 }
             }
         }
