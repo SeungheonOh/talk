@@ -673,47 +673,20 @@ fn deactivate(
     eprintln!("\u{1f4a4} Listening for wake event...\n");
 }
 
-/// Diff-based retype using common prefix + suffix to minimize destructive edits.
+/// Retype by backspacing all displayed text and typing the new text fresh.
 fn retype(enigo: &mut Enigo, displayed: &mut String, new_text: &str) {
     if *displayed == new_text {
         return;
     }
 
-    let old: Vec<char> = displayed.chars().collect();
-    let new: Vec<char> = new_text.chars().collect();
-
-    // Common prefix
-    let prefix = old.iter().zip(new.iter()).take_while(|(a, b)| a == b).count();
-
-    // Fast path: pure append (streaming tokens arrive at the end)
-    if prefix == old.len() {
-        let byte_off: usize = new_text.chars().take(prefix).map(|c| c.len_utf8()).sum();
-        let _ = enigo.text(&new_text[byte_off..]);
-        *displayed = new_text.to_string();
-        return;
-    }
-
-    // Common suffix (not overlapping with prefix)
-    let max_suffix = (old.len() - prefix).min(new.len() - prefix);
-    let suffix = (0..max_suffix)
-        .take_while(|&i| old[old.len() - 1 - i] == new[new.len() - 1 - i])
-        .count();
-
-    let remove_mid = old.len() - prefix - suffix;
-    let insert_mid: String = new[prefix..new.len() - suffix].iter().collect();
-
-    // Navigate left past unchanged suffix, edit, navigate back
-    for _ in 0..suffix {
-        let _ = enigo.key(Key::LeftArrow, Direction::Click);
-    }
-    for _ in 0..remove_mid {
+    // Backspace everything currently displayed
+    for _ in displayed.chars() {
         let _ = enigo.key(Key::Backspace, Direction::Click);
     }
-    if !insert_mid.is_empty() {
-        let _ = enigo.text(&insert_mid);
-    }
-    for _ in 0..suffix {
-        let _ = enigo.key(Key::RightArrow, Direction::Click);
+
+    // Type the new text
+    if !new_text.is_empty() {
+        let _ = enigo.text(new_text);
     }
 
     *displayed = new_text.to_string();
