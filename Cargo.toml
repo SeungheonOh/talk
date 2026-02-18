@@ -23,3 +23,15 @@ rustfft = "6"
 ureq = { version = "3", features = ["json"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+iced = { version = "0.14", features = ["tokio"] }
+tokio = { version = "1", features = ["time"] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "0.6"
+objc2-app-kit = { version = "0.3", features = [
+    "NSApplication", "NSRunningApplication", "NSWindow", "NSColor", "NSPanel", "NSResponder",
+    "NSStatusBar", "NSStatusItem", "NSMenu", "NSMenuItem",
+    "NSButton", "NSControl", "NSStatusBarButton", "NSView",
+] }
+objc2-foundation = { version = "0.3", features = ["NSArray", "NSString", "NSThread"] }
+objc2-core-foundation = "0.3"

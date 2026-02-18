@@ -15,7 +15,9 @@ literally, right, okay) ONLY when they serve no grammatical purpose. Keep them w
 part of a real phrase (e.g., \"I mean it\" stays, \"I mean um\" drops the \"um\").\n\
 3. False starts and repetitions: Remove stuttered or repeated words caused by streaming \
 (\"the the\" → \"the\", \"I I went\" → \"I went\"). Remove false starts where the speaker \
-restarts a thought (\"I went to the — I drove to the store\" → \"I drove to the store\").\n\
+restarts a thought (\"I went to the — I drove to the store\" → \"I drove to the store\"). \
+Remove ASR artifacts like ellipses (\"...\", \"…\") and trailing dashes (\" —\", \" -\") \
+that represent pauses or hesitation — these are not real punctuation.\n\
 4. Homophones and misheard words: Fix common ASR errors — their/there/they're, its/it's, \
 your/you're, to/too/two, would of → would have, could of → could have, should of → should have, \
 then/than, affect/effect, weather/whether, whose/who's, alot → a lot.\n\
@@ -53,6 +55,8 @@ Input: i should of went to the store earlier but i was to tired\n\
 Previous: The API uses OAuth tokens.\n\
 Input: so you need to pass the bearer token in the authorization header and then it returns jason with the results\n\
 {\"corrected\": \"So you need to pass the bearer token in the authorization header and then it returns JSON with the results.\"}\n\n\
+Input: so i was thinking... we could maybe... go to the park or something\n\
+{\"corrected\": \"So I was thinking we could maybe go to the park or something.\"}\n\n\
 Input: bueno eh entonces vamos a la la tienda y compramos um las manzanas\n\
 {\"corrected\": \"Bueno, entonces vamos a la tienda y compramos las manzanas.\"}";
 
@@ -141,10 +145,10 @@ fn llm_thread(
 
         let result = ureq::post(&url).send_json(&body);
 
-        // Check if a newer request arrived while we were blocking on HTTP
+        // Queue any newer request that arrived during HTTP, but still
+        // process the current response — partial corrections are useful.
         if let Ok(newer) = rx.try_recv() {
             pending = Some(newer);
-            continue;
         }
 
         let response = match result {
