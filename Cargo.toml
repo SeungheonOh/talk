@@ -3,6 +3,13 @@ name = "voicer"
 version = "0.1.0"
 edition = "2024"
 
+[features]
+default = []
+voxtral = ["cc"]
+
+[build-dependencies]
+cc = { version = "1", optional = true }
+
 [dependencies]
 whisper-rs = { version = "0.15", features = ["coreml"] }
 cpal = "0.17"
